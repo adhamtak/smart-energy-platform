@@ -25,3 +25,13 @@ checkpoints/
 .vscode/
 .DS_Store
 Thumbs.db
+
+
+# Local files not needed in the repository
+ami_generator.py
+generator/src/historical_generator_backup.py
+*.zip
+
+# Environment files
+.env.*
+!.env.example
