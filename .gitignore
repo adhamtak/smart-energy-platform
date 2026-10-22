@@ -1,0 +1,27 @@
+# Secrets and local settings
+.env
+
+# Generated data (regenerate with the seed; never commit)
+data/
+*.parquet
+*.csv
+*.ndjson
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Spark / Hadoop leftovers
+spark-warehouse/
+metastore_db/
+derby.log
+checkpoints/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,6 @@
+# Shell scripts must keep LF line endings, or they break inside Linux containers
+# when a teammate checks the repo out on Windows.
+*.sh text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.md text eol=lf

@@ -1,0 +1,118 @@
+# Smart Energy Intelligence Platform - shared infrastructure
+#
+#   cp .env.example .env
+#   docker compose up -d
+#
+# Services: MinIO (S3) + bucket init, Kafka (KRaft) + topic init, Kafka UI.
+# Everything joins one named network (smart-energy-net) so a teammate's Spark /
+# Trino / Airflow compose file can attach with:
+#   networks: { default: { name: smart-energy-net, external: true } }
+
+name: smart-energy
+
+services:
+  # ------------------------------------------------------------------
+  # Object storage (S3 API)
+  # ------------------------------------------------------------------
+  minio:
+    image: ${S3_IMAGE}
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${S3_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${S3_ROOT_PASSWORD}
+    ports:
+      - "${S3_API_PORT}:9000"       # S3 API   -> http://localhost:${S3_API_PORT}
+      - "${S3_CONSOLE_PORT}:9001"   # web UI   -> http://localhost:${S3_CONSOLE_PORT}
+    volumes:
+      - minio-data:/data
+    restart: unless-stopped
+
+  # One-shot: creates the bucket and the top-level prefixes, then exits.
+  minio-init:
+    # "-dev" tag because the plain Chainguard image has no shell.
+    image: cgr.dev/chainguard/minio-client:latest-dev
+    depends_on:
+      - minio
+    environment:
+      S3_ROOT_USER: ${S3_ROOT_USER}
+      S3_ROOT_PASSWORD: ${S3_ROOT_PASSWORD}
+      S3_BUCKET: ${S3_BUCKET}
+    entrypoint: ["/bin/sh", "/init/create_bucket.sh"]
+    volumes:
+      - ./docker/init/create_bucket.sh:/init/create_bucket.sh:ro
+    restart: "no"
+
+  # ------------------------------------------------------------------
+  # Kafka (single node, KRaft - no ZooKeeper)
+  # inside Docker -> kafka:29092      from your laptop -> localhost:${KAFKA_HOST_PORT}
+  # ------------------------------------------------------------------
+  kafka:
+    image: ${KAFKA_IMAGE}
+    hostname: kafka
+    ports:
+      - "${KAFKA_HOST_PORT}:${KAFKA_HOST_PORT}"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENERS: PLAINTEXT://:29092,PLAINTEXT_HOST://:${KAFKA_HOST_PORT},CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:${KAFKA_HOST_PORT}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Topics are created explicitly by kafka-init, so a typo can't create a stray topic.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # Single broker: internal topics cannot be replicated.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:29092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  # One-shot: creates the 4 topics, then exits.
+  kafka-init:
+    image: ${KAFKA_IMAGE}
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP: kafka:29092
+      TOPIC_READINGS: ${TOPIC_READINGS}
+      TOPIC_STATUS: ${TOPIC_STATUS}
+      TOPIC_ALERTS: ${TOPIC_ALERTS}
+      TOPIC_DLQ: ${TOPIC_DLQ}
+      READINGS_PARTITIONS: ${READINGS_PARTITIONS}
+    entrypoint: ["/bin/sh", "/init/create_topics.sh"]
+    volumes:
+      - ./docker/init/create_topics.sh:/init/create_topics.sh:ro
+    restart: "no"
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      DYNAMIC_CONFIG_ENABLED: "false"
+    ports:
+      - "${KAFKA_UI_PORT}:8080"     # -> http://localhost:${KAFKA_UI_PORT}
+    restart: unless-stopped
+
+volumes:
+  minio-data:
+  kafka-data:
+
+networks:
+  default:
+    name: smart-energy-net
