@@ -4,157 +4,105 @@ import json
 import os
 import signal
 import time
-import uuid
 from pathlib import Path
 
 import pandas as pd
 from dotenv import load_dotenv
+from kafka import KafkaProducer
+
+from streaming_generator import StreamingSimulator
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 load_dotenv(PROJECT_ROOT / ".env")
 
-DEFAULT_DATA_DIR = PROJECT_ROOT / "data" / "generated-100k-1day"
-
-REQUIRED_COLUMNS = {
-    "reading_id",
-    "event_timestamp",
-    "meter_id",
-    "transformer_id",
-    "voltage_v",
-    "active_power_kw",
-    "reactive_power_kvar",
-    "energy_kwh",
-    "power_factor",
-    "schema_version",
-}
+DEFAULT_DATA_DIR = PROJECT_ROOT / "data" / "scale-test-100k-1day-v2"
 
 STOP_REQUESTED = False
 
 
 def request_stop(signum, frame):
+    """Request a graceful shutdown."""
     global STOP_REQUESTED
     STOP_REQUESTED = True
 
 
 def json_default(value):
+    """Convert common NumPy and pandas values into JSON-compatible values."""
     if isinstance(value, pd.Timestamp):
         return value.isoformat()
+
     if hasattr(value, "item"):
         return value.item()
+
     raise TypeError(f"Cannot serialize {type(value).__name__}")
 
 
-def load_interval(data_dir, timestamp):
-    """Load and validate one interval containing one reading per meter."""
-    readings_dir = data_dir / "readings"
-    files = sorted(readings_dir.glob("part-*.parquet"))
-
-    if not files:
-        raise FileNotFoundError(f"No Parquet files found in {readings_dir}")
-
-    target = pd.to_datetime(timestamp, utc=True)
-    frames = []
-
-    print(f"Scanning {len(files):,} Parquet files for {target}...")
-
-    for index, path in enumerate(files, start=1):
-        frame = pd.read_parquet(
-            path,
-            columns=sorted(REQUIRED_COLUMNS),
-        )
-
-        missing = REQUIRED_COLUMNS - set(frame.columns)
-        if missing:
-            raise ValueError(
-                f"{path.name} is missing columns: {sorted(missing)}"
-            )
-
-        frame["event_timestamp"] = pd.to_datetime(
-            frame["event_timestamp"], utc=True
-        )
-        frame = frame.loc[frame["event_timestamp"] == target]
-
-        if not frame.empty:
-            frames.append(frame)
-
-        if index % 50 == 0 or index == len(files):
-            print(f"Scanned {index:,}/{len(files):,} files")
-
-    if not frames:
-        raise ValueError(f"No readings found for {target}")
-
-    df = pd.concat(frames, ignore_index=True)
-
-    if df["meter_id"].duplicated().any():
-        raise ValueError("Duplicate meter readings found in this interval.")
-
-    df = df.sort_values(
-        ["transformer_id", "meter_id"]
-    ).reset_index(drop=True)
-
-    df = df.astype(object).where(pd.notna(df), None)
-
-    return df, len(files), target
-
-
-def make_interval(base_df, timestamp, interval_number):
-    """
-    Create a distinct synthetic interval from a validated template.
-
-    Measurement values are reused as synthetic test values.
-    This does not represent newly measured electricity consumption.
-    """
-    df = base_df.copy()
-
-    df["event_timestamp"] = pd.to_datetime(timestamp, utc=True)
-
-    # Deterministic IDs: unique for each simulated interval and meter.
-    df["reading_id"] = [
-        f"sim-{interval_number:06d}-{meter_id}"
-        for meter_id in df["meter_id"]
-    ]
-
-    return df.astype(object).where(pd.notna(df), None)
-
-
-def main():
+def parse_arguments():
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Continuously publish synthetic AMI readings to Kafka."
+        description=(
+            "Generate fresh synthetic AMI readings and publish them to Kafka."
+        )
     )
 
-    parser.add_argument("--input-dir", type=Path, default=DEFAULT_DATA_DIR)
-    parser.add_argument("--topic", default="ami-readings-stream")
+    parser.add_argument(
+        "--input-dir",
+        type=Path,
+        default=DEFAULT_DATA_DIR,
+        help="Dataset directory containing dim_meter.parquet.",
+    )
+
+    parser.add_argument(
+        "--topic",
+        default="ami-readings-stream",
+        help="Kafka topic to publish to.",
+    )
+
     parser.add_argument(
         "--interval-timestamp",
         default="2026-07-01T00:00:00Z",
+        help="Fallback starting event timestamp in UTC.",
     )
+
+    parser.add_argument(
+        "--start-time",
+        default=None,
+        help="Starting event timestamp in UTC; overrides --interval-timestamp.",
+    )
+
     parser.add_argument(
         "--rate",
         type=float,
         default=300,
         help="Target publishing rate in events per second.",
     )
+
     parser.add_argument(
         "--continuous",
         action="store_true",
-        help="Continue publishing until Ctrl+C or a configured limit.",
+        help="Continue publishing until stopped or a configured limit is reached.",
     )
+
     parser.add_argument(
         "--duration-minutes",
         type=float,
         default=None,
-        help="Optional wall-clock duration limit.",
+        help="Optional wall-clock publishing duration in minutes.",
     )
+
     parser.add_argument(
         "--max-events",
         type=int,
         default=None,
-        help="Optional maximum number of events to publish.",
+        help="Optional maximum number of messages to publish.",
     )
+
     parser.add_argument(
         "--publish",
         action="store_true",
-        help="Actually send messages. Without this flag, preview only.",
+        help="Actually publish messages to Kafka. Otherwise, perform a dry run.",
     )
 
     args = parser.parse_args()
@@ -165,62 +113,96 @@ def main():
     if args.duration_minutes is not None:
         if args.duration_minutes <= 0:
             parser.error("--duration-minutes must be positive.")
+
         if not args.continuous:
             parser.error("--duration-minutes requires --continuous.")
 
     if args.max_events is not None:
         if args.max_events <= 0:
             parser.error("--max-events must be positive.")
+
         if not args.continuous:
             parser.error("--max-events requires --continuous.")
 
+    return args
+
+
+def validate_simulator(simulator):
+    """Validate the expected number of meters."""
+    if simulator.count != 100_000:
+        raise ValueError(
+            f"Expected 100,000 meters, found {simulator.count:,}."
+        )
+
+
+def show_dry_run(simulator, first_timestamp):
+    """Generate and display one interval without publishing to Kafka."""
+    sample = simulator.next_interval(first_timestamp, 1)
+
+    if len(sample) != simulator.count:
+        raise ValueError(
+            f"Expected {simulator.count:,} readings, "
+            f"generated {len(sample):,}."
+        )
+
+    if sample["meter_id"].nunique() != simulator.count:
+        raise ValueError("Generated interval contains duplicate meter IDs.")
+
+    print("\nDRY RUN: no messages will be sent.")
+    print(f"Readings generated: {len(sample):,}")
+    print("\nSample readings:")
+
+    preview_columns = [
+        "reading_id",
+        "event_timestamp",
+        "meter_id",
+        "active_power_kw",
+        "voltage_v",
+    ]
+
+    print(sample[preview_columns].head().to_string(index=False))
+    print("\nValidation passed. Add --publish to send messages.")
+
+
+def main():
+    global STOP_REQUESTED
+
+    args = parse_arguments()
+
     data_dir = args.input_dir.resolve()
-    manifest_path = data_dir / "manifest.json"
 
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"manifest.json not found in {data_dir}")
+    if not data_dir.is_dir():
+        raise FileNotFoundError(
+            f"Dataset directory does not exist: {data_dir}"
+        )
 
-    with manifest_path.open("r", encoding="utf-8") as file:
-        manifest = json.load(file)
+    simulator = StreamingSimulator(data_dir)
+    validate_simulator(simulator)
 
-    if manifest.get("data_type") != "synthetic":
-        raise ValueError("Expected a dataset marked as synthetic.")
-
-    base_df, file_count, first_timestamp = load_interval(
-        data_dir, args.interval_timestamp
+    first_timestamp = pd.to_datetime(
+        args.start_time or args.interval_timestamp,
+        utc=True,
     )
 
-    unique_meters = base_df["meter_id"].nunique()
-
-    print(f"\nDataset: {data_dir}")
-    print(f"Parquet files scanned: {file_count:,}")
-    print(f"First interval: {first_timestamp}")
-    print(f"Readings per interval: {len(base_df):,}")
-    print(f"Unique meters: {unique_meters:,}")
-    print(f"Topic: {args.topic}")
+    print("\nSmart Energy Intelligence Platform")
+    print("-" * 42)
+    print(f"Grid dimensions: {data_dir}")
+    print(f"Start timestamp: {first_timestamp}")
+    print(f"Meters: {simulator.count:,}")
+    print(f"Kafka topic: {args.topic}")
     print(f"Target rate: {args.rate:,.0f} events/second")
 
-    if len(base_df) != 100_000 or unique_meters != 100_000:
-        raise ValueError(
-            "Expected 100,000 readings from 100,000 unique meters."
-        )
-
     if not args.publish:
-        print("\nDRY RUN: no messages will be sent.")
-        print(
-            base_df[
-                ["reading_id", "event_timestamp", "meter_id"]
-            ].head().to_string(index=False)
-        )
-        print("\nValidation passed. Add --publish to send messages.")
+        show_dry_run(simulator, first_timestamp)
         return
 
-    from kafka import KafkaProducer
+    bootstrap_servers = os.getenv(
+        "KAFKA_BOOTSTRAP_SERVERS",
+        "localhost:9092",
+    )
 
     producer = KafkaProducer(
-        bootstrap_servers=os.getenv(
-            "KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"
-        ),
+        bootstrap_servers=bootstrap_servers,
         acks="all",
         retries=5,
         key_serializer=lambda key: str(key).encode("utf-8"),
@@ -231,7 +213,6 @@ def main():
         ).encode("utf-8"),
     )
 
-    global STOP_REQUESTED
     STOP_REQUESTED = False
 
     previous_sigint = signal.signal(signal.SIGINT, request_stop)
@@ -262,13 +243,17 @@ def main():
 
             interval_number += 1
 
-            if interval_number == 1:
-                interval_df = base_df.copy()
-            else:
-                interval_df = make_interval(
-                    base_df,
-                    current_timestamp,
-                    interval_number,
+            # Generate fresh readings for this simulated 15-minute interval.
+            interval_df = simulator.next_interval(
+                current_timestamp,
+                interval_number,
+            )
+
+            if len(interval_df) != simulator.count:
+                raise ValueError(
+                    f"Interval {interval_number} generated "
+                    f"{len(interval_df):,} readings; "
+                    f"expected {simulator.count:,}."
                 )
 
             interval_start = time.monotonic()
@@ -296,14 +281,16 @@ def main():
                 total_sent += 1
                 sent_this_interval += 1
 
-                # Pace messages against the target rate.
+                # Pace messages against the configured target rate.
                 target_elapsed = sent_this_interval / args.rate
                 actual_elapsed = time.monotonic() - interval_start
+
                 if target_elapsed > actual_elapsed:
                     time.sleep(target_elapsed - actual_elapsed)
 
                 if total_sent % 10_000 == 0:
                     elapsed = max(time.monotonic() - start, 0.001)
+
                     print(
                         f"Queued {total_sent:,} events | "
                         f"{total_sent / elapsed:,.1f} events/sec average"
@@ -313,6 +300,7 @@ def main():
             producer.flush()
 
             elapsed = max(time.monotonic() - start, 0.001)
+
             print(
                 f"Interval {interval_number}: "
                 f"{sent_this_interval:,} messages | "
@@ -323,28 +311,32 @@ def main():
             if STOP_REQUESTED:
                 break
 
+            # Do not start another interval if the current one was partial.
             if sent_this_interval < len(interval_df):
                 break
 
+            # Advance simulated event time by 15 minutes.
             current_timestamp += pd.Timedelta(minutes=15)
 
-        producer.flush()
-
     finally:
-        producer.close()
-        signal.signal(signal.SIGINT, previous_sigint)
-        signal.signal(signal.SIGTERM, previous_sigterm)
+        try:
+            producer.flush()
+        finally:
+            producer.close()
+
+            signal.signal(signal.SIGINT, previous_sigint)
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
         elapsed = max(time.monotonic() - start, 0.001)
 
         print("\nPublisher stopped.")
         print(f"Messages queued: {total_sent:,}")
-        print(f"Elapsed time: {elapsed:.1f} seconds")
-        print(f"Average rate: {total_sent / elapsed:,.2f} events/sec")
-        print(f"Topic: {args.topic}")
+        print(f"Elapsed wall-clock time: {elapsed:.1f} seconds")
+        print(f"Average publishing rate: {total_sent / elapsed:,.2f} events/sec")
+        print(f"Kafka topic: {args.topic}")
         print(
-            "Verify broker and MinIO counts separately; queued messages "
-            "are not proof of end-to-end ingestion."
+            "Verify Kafka consumption and MinIO ingestion separately; "
+            "queued messages do not prove end-to-end ingestion."
         )
 
 
