@@ -1,3 +1,4 @@
+"""Shared generator configuration, read from the project's .env file."""
 
 import os
 from dataclasses import dataclass
@@ -6,8 +7,18 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Project root: smart-energy-platform/
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+def find_project_root(start: Path) -> Path:
+    """Walk upwards to the folder holding .env / docker-compose.yml / .git."""
+    start = Path(start).resolve()
+    for candidate in (start, *start.parents):
+        if any((candidate / marker).exists()
+               for marker in (".env", "docker-compose.yml", ".git")):
+            return candidate
+    return start
+
+
+PROJECT_ROOT = find_project_root(Path(__file__).parent)
 load_dotenv(PROJECT_ROOT / ".env")
 
 
@@ -19,7 +30,7 @@ class GeneratorConfig:
     start_date: date
     meters_per_transformer: int
 
-    # Keep test output isolated from existing smoke-test data.
+    # Upload target (must match what upload_to_minio.py uses).
     s3_bucket: str
     s3_prefix: str
 
@@ -27,17 +38,19 @@ class GeneratorConfig:
     def from_env(cls) -> "GeneratorConfig":
         return cls(
             seed=int(os.getenv("GEN_SEED", "42")),
+            # Small defaults for smoke tests. For the project dataset set
+            # GEN_NUM_METERS=100000 and GEN_NUM_DAYS=6 in .env.
             num_meters=int(os.getenv("GEN_NUM_METERS", "10")),
-            num_days=int(os.getenv("GEN_NUM_DAYS", "2")),
+            num_days=int(os.getenv("GEN_NUM_DAYS", "6")),
             start_date=date.fromisoformat(
                 os.getenv("GEN_START_DATE", "2026-07-01")
             ),
             meters_per_transformer=int(
                 os.getenv("GEN_METERS_PER_TRANSFORMER", "10")
             ),
-            s3_bucket=os.getenv("S3_BUCKET", "lakehouse"),
+            s3_bucket=os.getenv("S3_BUCKET", "smart-energy"),
             s3_prefix=os.getenv(
-                "GEN_S3_PREFIX", "dev/historical-generator"
+                "GEN_S3_PREFIX", "bronze/historical"
             ).strip("/"),
         )
 

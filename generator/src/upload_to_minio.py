@@ -1,19 +1,43 @@
+"""Upload the historical dataset (any number of days) to MinIO as Bronze.
+
+Layout (identical date partitions to the streaming consumer):
+
+    <prefix>/run_id=<run>/reference/<dim>/part-00000.parquet
+    <prefix>/run_id=<run>/readings/year=YYYY/month=MM/day=DD/part-*.parquet
+    <prefix>/run_id=<run>/readings/year=YYYY/month=MM/day=DD/_DAY_CLOSED
+    <prefix>/run_id=<run>/metadata/manifest.json            (uploaded last)
+
+It uploads the `readings_by_date/dt=YYYY-MM-DD/` folders written by
+historical_generator.py.
+"""
 
 import argparse
-from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import boto3
+import pyarrow.parquet as pq
 from botocore.config import Config
 from dotenv import load_dotenv
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+def find_project_root(start: Path) -> Path:
+    start = Path(start).resolve()
+    for candidate in (start, *start.parents):
+        if any((candidate / marker).exists()
+               for marker in (".env", "docker-compose.yml", ".git")):
+            return candidate
+    return start
+
+
+PROJECT_ROOT = find_project_root(Path(__file__).parent)
 load_dotenv(PROJECT_ROOT / ".env")
 
-DEFAULT_DATA_DIR = PROJECT_ROOT / "data" / "generated-100k-1day"
+DEFAULT_DATA_DIR = PROJECT_ROOT / "data" / "generated-100k-6days"
 
 
 def get_s3_client():
@@ -35,13 +59,58 @@ def get_s3_client():
         config=Config(
             signature_version="s3v4",
             s3={"addressing_style": "path"},
+            max_pool_connections=32,
         ),
     )
 
 
-def upload_file(client, bucket, key, path):
-    client.upload_file(str(path), bucket, key)
-    print(f"Uploaded s3://{bucket}/{key}")
+def date_path(day: str) -> str:
+    """'2026-07-07' -> 'year=2026/month=07/day=07'."""
+    year, month, dd = day.split("-")
+    return f"year={year}/month={month}/day={dd}"
+
+
+def collect_day_files(data_dir: Path, manifest: dict) -> dict:
+    """Validate readings_by_date/ against the manifest; return {day: [files]}."""
+    by_date_dir = data_dir / "readings_by_date"
+    if not by_date_dir.is_dir():
+        raise FileNotFoundError(
+            f"Missing {by_date_dir}. Re-run historical_generator.py (without "
+            "--skip-partition) to create the date-partitioned readings."
+        )
+
+    start_date = datetime.strptime(manifest["start_date"], "%Y-%m-%d").date()
+    expected_days = [
+        (start_date + timedelta(days=i)).isoformat()
+        for i in range(manifest["num_days"])
+    ]
+
+    found = {
+        path.name.removeprefix("dt="): sorted(path.glob("part-*.parquet"))
+        for path in sorted(by_date_dir.glob("dt=*"))
+        if path.is_dir()
+    }
+    if sorted(found) != expected_days:
+        raise ValueError(
+            f"Date partitions {sorted(found)} do not match the manifest "
+            f"({expected_days})."
+        )
+
+    expected_files = -(-manifest["num_meters"] // manifest["batch_meters"])
+    expected_rows = manifest["num_meters"] * manifest["readings_per_meter_per_day"]
+
+    for day, files in found.items():
+        if len(files) != expected_files:
+            raise ValueError(
+                f"{day}: expected {expected_files} files, found {len(files)}."
+            )
+        rows = sum(pq.ParquetFile(f).metadata.num_rows for f in files)
+        if rows != expected_rows:
+            raise ValueError(
+                f"{day}: expected {expected_rows:,} rows, found {rows:,}."
+            )
+
+    return found
 
 
 def main():
@@ -53,6 +122,12 @@ def main():
         type=Path,
         default=DEFAULT_DATA_DIR,
         help="Generated dataset directory.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="Parallel upload threads.",
     )
     args = parser.parse_args()
 
@@ -70,28 +145,7 @@ def main():
     if manifest.get("data_type") != "synthetic":
         raise ValueError("Refusing to upload an unlabelled/non-synthetic dataset.")
 
-    if manifest.get("num_days") != 1:
-        raise ValueError(
-            "This uploader version expects a one-day dataset. "
-            "Do not use it for a multi-day dataset without adding date partitioning."
-        )
-
-    start_date = datetime.strptime(
-        manifest["start_date"], "%Y-%m-%d"
-    ).date()
-
-    reading_files = sorted((data_dir / "readings").glob("part-*.parquet"))
-    if not reading_files:
-        raise FileNotFoundError(
-            f"No readings/part-*.parquet files found in {data_dir}"
-        )
-
-    expected_files = (manifest["num_meters"] + manifest["batch_meters"] - 1) // manifest["batch_meters"]
-    if len(reading_files) != expected_files:
-        raise ValueError(
-            f"Expected {expected_files} reading files from the manifest, "
-            f"found {len(reading_files)}."
-        )
+    day_files = collect_day_files(data_dir, manifest)
 
     dimension_names = [
         "dim_region",
@@ -104,56 +158,64 @@ def main():
         if not (data_dir / f"{name}.parquet").is_file():
             raise FileNotFoundError(f"Missing dimension table: {name}.parquet")
 
-    bucket = os.getenv("S3_BUCKET", "lakehouse")
-    base_prefix = os.getenv(
-        "GEN_S3_PREFIX", "dev/historical-generator"
-    ).strip("/")
-
+    bucket = os.getenv("S3_BUCKET", "smart-energy")
+    base_prefix = os.getenv("GEN_S3_PREFIX", "bronze/historical").strip("/")
     if not base_prefix:
         raise ValueError("GEN_S3_PREFIX must be a non-empty development prefix.")
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_id = f"run_{timestamp}_{uuid.uuid4().hex[:6]}"
-    prefix = f"{base_prefix}/runs/{run_id}"
+    prefix = f"{base_prefix}/run_id={run_id}"
+
+    total_files = sum(len(files) for files in day_files.values())
 
     print(f"Dataset: {data_dir}")
-    print(f"Dataset type: synthetic")
+    print("Dataset type: synthetic")
     print(f"Meters: {manifest['num_meters']:,}")
+    print(f"Days: {manifest['num_days']} ({min(day_files)} .. {max(day_files)})")
     print(f"Expected readings: {manifest['records']['readings']:,}")
-    print(f"Reading files: {len(reading_files):,}")
+    print(f"Reading files: {total_files:,}")
     print(f"Bucket: {bucket}")
     print(f"New upload prefix: {prefix}")
 
     client = get_s3_client()
     client.head_bucket(Bucket=bucket)
 
-    # Upload reference dimensions.
+    # Reference dimensions.
     for name in dimension_names:
-        path = data_dir / f"{name}.parquet"
         key = f"{prefix}/reference/{name}/part-00000.parquet"
-        upload_file(client, bucket, key, path)
+        client.upload_file(str(data_dir / f"{name}.parquet"), bucket, key)
+        print(f"Uploaded s3://{bucket}/{key}")
 
-    # This dataset contains one simulated day. Each meter batch file
-    # covers that day, so all files belong in the same date partition.
-    year = start_date.strftime("%Y")
-    month = start_date.strftime("%m")
-    day = start_date.strftime("%d")
+    # Readings: one date partition per day, uploaded in parallel.
+    jobs = []
+    for day, files in day_files.items():
+        target = f"{prefix}/readings/{date_path(day)}"
+        for path in files:
+            jobs.append((path, f"{target}/{path.name}"))
 
-    reading_prefix = (
-        f"{prefix}/bronze/smart_meter_readings/"
-        f"year={year}/month={month}/day={day}"
-    )
+    def upload(job):
+        path, key = job
+        client.upload_file(str(path), bucket, key)
+        return key
 
-    for index, path in enumerate(reading_files):
-        key = f"{reading_prefix}/{path.name}"
-        upload_file(client, bucket, key, path)
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        for count, _ in enumerate(pool.map(upload, jobs), start=1):
+            if count % 50 == 0 or count == len(jobs):
+                print(f"Uploaded {count:,}/{len(jobs):,} reading files")
+
+    # Per-day completion marker, same name the streaming consumer writes.
+    expected_rows = manifest["num_meters"] * manifest["readings_per_meter_per_day"]
+    for day in day_files:
+        client.put_object(
+            Bucket=bucket,
+            Key=f"{prefix}/readings/{date_path(day)}/_DAY_CLOSED",
+            Body=json.dumps({"dt": day, "expected_rows": expected_rows}).encode(),
+        )
 
     # Upload manifest last so it signals that all dataset objects uploaded.
-    upload_file(
-        client,
-        bucket,
-        f"{prefix}/metadata/manifest.json",
-        manifest_path,
+    client.upload_file(
+        str(manifest_path), bucket, f"{prefix}/metadata/manifest.json"
     )
 
     print("\nUpload complete.")

@@ -1,5 +1,6 @@
 import pyarrow as pa
 import pyarrow.parquet as pq
+import numpy as np
 import argparse
 import json
 import math
@@ -11,6 +12,23 @@ from collections import defaultdict
 import pandas as pd
 
 from config import GeneratorConfig
+
+
+STANDARD_TRANSFORMER_KVA = [25, 50, 100, 160, 250, 400, 630, 1000]
+
+
+def _rated_capacity_kva(meters_per_transformer):
+    """Pick a standard transformer size for the meters it serves.
+
+    Normal load is roughly 2 kVA per meter; size for about 60% loading so an
+    injected overload (105-120%) is a realistic multiple of normal load and not
+    a 25x spike on every meter.
+    """
+    needed = meters_per_transformer * 2.0 / 0.6
+    for size in STANDARD_TRANSFORMER_KVA:
+        if size >= needed:
+            return float(size)
+    return float(math.ceil(needed / 250) * 250)
 
 
 def generate_dimensions(config):
@@ -73,7 +91,7 @@ def generate_dimensions(config):
             "transformer_id": f"TX_{region_id}_{i + 1:04d}",
             "substation_id": substation["substation_id"],
             "region_id": region_id,
-            "rated_capacity_kva": 500.0,
+            "rated_capacity_kva": _rated_capacity_kva(meters_per_transformer),
             "nominal_voltage_v": 380.0,
             "install_date": date(2020, 1, 1),
             "status": "ACTIVE",
@@ -116,73 +134,74 @@ def generate_dimensions(config):
     return regions, substations, transformers, meters
 
 def generate_reading_batch(config, meters, rng):
-    """Generate readings for one batch of meters."""
-    readings = []
+    """Generate readings for one batch of meters (vectorized).
 
-    start = datetime.combine(
-        config.start_date,
-        time.min,
-        tzinfo=timezone.utc,
-    )
-
+    Same formulas as before (independent draws per meter and interval); returns
+    a DataFrame with the contract columns and dtypes.
+    """
     profiles = {
-    "RESIDENTIAL": (0.35, 1.8),
-    "COMMERCIAL": (1.2, 4.0),
-    "INDUSTRIAL": (3.0, 12.0),
-    "AGRICULTURAL": (0.8, 5.0),
-    "GOVERNMENT": (0.7, 3.5),
-    "PUBLIC_LIGHTING": (0.1, 1.5),
-    "OTHER": (0.3, 2.0),
+        "RESIDENTIAL": (0.35, 1.8),
+        "COMMERCIAL": (1.2, 4.0),
+        "INDUSTRIAL": (3.0, 12.0),
+        "AGRICULTURAL": (0.8, 5.0),
+        "GOVERNMENT": (0.7, 3.5),
+        "PUBLIC_LIGHTING": (0.1, 1.5),
+        "OTHER": (0.3, 2.0),
     }
 
-    for meter in meters:
-        base_kw, peak_kw = profiles[meter["customer_type"]]
+    n_intervals = config.num_days * 96
+    n_meters = len(meters)
+    start = datetime.combine(config.start_date, time.min, tzinfo=timezone.utc)
 
-        for interval in range(config.num_days * 96):
-            event_time = start + timedelta(minutes=15 * interval)
-            hour = event_time.hour
+    stamps = [start + timedelta(minutes=15 * i) for i in range(n_intervals)]
+    ts_text = np.array(
+        [t.isoformat().replace("+00:00", "Z") for t in stamps], dtype=object
+    )
+    ts_id = np.array([t.strftime("%Y%m%d%H%M") for t in stamps], dtype=object)
+    hours = np.array([t.hour for t in stamps])
+    evening_factor = np.where(
+        (hours >= 17) & (hours <= 22),
+        1.0,
+        np.where((hours >= 7) & (hours <= 16), 0.55, 0.25),
+    )
 
-            evening_factor = (
-                1.0 if 17 <= hour <= 22
-                else 0.55 if 7 <= hour <= 16
-                else 0.25
-            )
+    base_kw = np.array([profiles[m["customer_type"]][0] for m in meters])
+    peak_kw = np.array([profiles[m["customer_type"]][1] for m in meters])
 
-            active_power_kw = max(
-                0.05,
-                base_kw
-                + peak_kw * evening_factor * rng.uniform(0.65, 1.0),
-            )
+    nprng = np.random.default_rng(rng.getrandbits(64))
+    shape = (n_meters, n_intervals)
 
-            reactive_power_kvar = (
-                active_power_kw * rng.uniform(0.15, 0.4)
-            )
-            energy_kwh = active_power_kw * 0.25
+    active = np.maximum(
+        0.05,
+        base_kw[:, None]
+        + peak_kw[:, None] * evening_factor[None, :] * nprng.uniform(0.65, 1.0, shape),
+    )
+    reactive = active * nprng.uniform(0.15, 0.4, shape)
+    energy = active * 0.25
+    power_factor = active / np.sqrt(active**2 + reactive**2)
+    voltage = nprng.normal(220.0, 2.0, shape)
 
-            apparent_power_kva = math.sqrt(
-                active_power_kw**2 + reactive_power_kvar**2
-            )
-            power_factor = active_power_kw / apparent_power_kva
+    prefixes = np.array([f"READ_{m['meter_id']}_" for m in meters], dtype=object)
+    reading_ids = np.add.outer(prefixes, ts_id).ravel()
 
-            readings.append({
-                "reading_id": (
-                    f"READ_{meter['meter_id']}_"
-                    f"{event_time.strftime('%Y%m%d%H%M')}"
-                ),
-                "event_timestamp": (
-                    event_time.isoformat().replace("+00:00", "Z")
-                ),
-                "meter_id": meter["meter_id"],
-                "transformer_id": meter["transformer_id"],
-                "voltage_v": round(rng.gauss(220.0, 2.0), 2),
-                "active_power_kw": round(active_power_kw, 4),
-                "reactive_power_kvar": round(reactive_power_kvar, 4),
-                "energy_kwh": round(energy_kwh, 4),
-                "power_factor": round(power_factor, 4),
-                "schema_version": 1,
-            })
-
-    return readings
+    df = pd.DataFrame({
+        "reading_id": reading_ids,
+        "event_timestamp": np.tile(ts_text, n_meters),
+        "meter_id": np.repeat(
+            np.array([m["meter_id"] for m in meters], dtype=object), n_intervals
+        ),
+        "transformer_id": np.repeat(
+            np.array([m["transformer_id"] for m in meters], dtype=object),
+            n_intervals,
+        ),
+        "voltage_v": np.round(voltage.ravel(), 2),
+        "active_power_kw": np.round(active.ravel(), 4),
+        "reactive_power_kvar": np.round(reactive.ravel(), 4),
+        "energy_kwh": np.round(energy.ravel(), 4),
+        "power_factor": np.round(power_factor.ravel(), 4),
+        "schema_version": np.full(n_meters * n_intervals, 1, dtype=np.int32),
+    })
+    return df
 
 
 def write_dimensions(output_dir, dimensions):
@@ -353,10 +372,11 @@ def _make_anomaly_plan(config, dimensions):
 
     # Irregular consumption: a sudden spike or a sharp drop at a meter.
     all_meter_ids = [m["meter_id"] for m in meters]
+    meter_lookup = {m["meter_id"]: m for m in meters}
 
     for i in range(event_count):
         meter_id = rng.choice(all_meter_ids)
-        meter = next(m for m in meters if m["meter_id"] == meter_id)
+        meter = meter_lookup[meter_id]
 
         duration = _event_duration(rng, total_intervals)
         start_idx = rng.randint(0, total_intervals - duration)
@@ -701,6 +721,40 @@ def inject_anomalies(output_dir, config, dimensions):
 
 
 
+def write_partitioned_by_date(output_dir):
+    """Re-write the final readings as Hive-style date partitions.
+
+    Layout: <output_dir>/readings_by_date/dt=YYYY-MM-DD/part-XXXXX.parquet
+    This is the same layout the streaming consumer must use, so history and the
+    stream land side by side and a closed streaming day is just another partition.
+    `dt` is derived from the reading's own event_timestamp, never wall-clock time.
+    """
+    output_dir = Path(output_dir)
+    src_files = sorted((output_dir / "readings").glob("part-*.parquet"))
+    dst_root = output_dir / "readings_by_date"
+    if dst_root.exists():
+        for old in dst_root.rglob("*.parquet"):
+            old.unlink()
+
+    days = set()
+    for batch_number, path in enumerate(src_files):
+        table = pq.read_table(path)
+        dt = pd.Series(table.column("event_timestamp").to_pandas().str[:10])
+        for day in sorted(dt.unique()):
+            mask = pa.array((dt == day).to_numpy())
+            part_dir = dst_root / f"dt={day}"
+            part_dir.mkdir(parents=True, exist_ok=True)
+            pq.write_table(
+                table.filter(mask),
+                part_dir / f"part-{batch_number:05d}.parquet",
+                compression="snappy",
+            )
+            days.add(day)
+
+    print(f"Wrote date-partitioned readings ({len(days)} days) -> {dst_root}")
+    return sorted(days)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate synthetic smart-meter historical data in chunks."
@@ -718,6 +772,12 @@ def main():
         type=int,
         default=250,
         help="Number of meters held in memory per reading batch.",
+    )
+
+    parser.add_argument(
+        "--skip-partition",
+        action="store_true",
+        help="Do not write the readings_by_date/dt=YYYY-MM-DD layout.",
     )
 
     args = parser.parse_args()
@@ -763,9 +823,7 @@ def main():
     for offset in range(0, len(meters), args.batch_meters):
         meter_batch = meters[offset:offset + args.batch_meters]
 
-        rows = generate_reading_batch(config, meter_batch, rng)
-        df = pd.DataFrame(rows)
-        df["schema_version"] = df["schema_version"].astype("int32")
+        df = generate_reading_batch(config, meter_batch, rng)
 
         path = readings_dir / f"part-{batch_number:05d}.parquet"
         df.to_parquet(path, index=False, compression="snappy")
@@ -781,7 +839,7 @@ def main():
         )
 
         # Release this batch before generating the next one.
-        del rows, df
+        del df
 
     # Inject anomalies only after every normal reading batch exists.
     # The function also writes the separate ground-truth answer key.
@@ -795,6 +853,10 @@ def main():
             meters,
         ),
     )
+
+    # Date-partitioned copy (shared layout with the streaming consumer).
+    if not args.skip_partition:
+        write_partitioned_by_date(output_dir)
 
     # Write the manifest after injection so it can describe the final dataset.
     write_manifest(
