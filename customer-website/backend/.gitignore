@@ -1,0 +1,5 @@
+# Generated locally: never commit
+users.json
+demo_credentials.txt
+.jwt_secret
+__pycache__/
