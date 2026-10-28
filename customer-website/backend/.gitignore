@@ -1,5 +1,8 @@
-# Generated locally: never commit
+# Secrets and generated files: never commit
+.env
 users.json
 demo_credentials.txt
 .jwt_secret
+snowflake_report.txt
+warehouse_mapping.json.local
 __pycache__/

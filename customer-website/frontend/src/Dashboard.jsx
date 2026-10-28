@@ -129,40 +129,40 @@ export default function Dashboard({ user, onSignOut }) {
             <LineCard title="Power factor" data={data.readings} y="pf" unit="" color="pf" multiDay={multiDay} domain={[0, 1]} />
           </div>
 
-          <h2>Incidents on this meter or its transformer</h2>
-          {data.incidents.length === 0 ? (
-            <div className="card muted">No incidents recorded.</div>
-          ) : (
-            <div className="card table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Detected</th>
-                    <th>Severity</th>
-                    <th>Type</th>
-                    <th>Asset</th>
-                    <th>Status</th>
-                    <th>Observed</th>
-                    <th>Threshold</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {data.incidents.map((i, n) => (
-                    <tr key={i.incident_id ?? n}>
-                      <td>{when(i.detected_at)}</td>
-                      <td>
-                        <span className={`badge ${String(i.severity).toLowerCase()}`}>{i.severity}</span>
-                      </td>
-                      <td>{i.anomaly_type}</td>
-                      <td>{i.asset_id}</td>
-                      <td>{i.status}</td>
-                      <td>{fmt(i.observed_value, 2)}</td>
-                      <td>{fmt(i.threshold, 2)}</td>
+          {data.incidents.length > 0 && (
+            <>
+              <h2>Incidents on this meter or its transformer</h2>
+              <div className="card table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Detected</th>
+                      <th>Severity</th>
+                      <th>Type</th>
+                      <th>Asset</th>
+                      <th>Status</th>
+                      <th>Observed</th>
+                      <th>Threshold</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                  </thead>
+                  <tbody>
+                    {data.incidents.map((i, n) => (
+                      <tr key={i.incident_id ?? n}>
+                        <td>{when(i.detected_at)}</td>
+                        <td>
+                          <span className={`badge ${String(i.severity).toLowerCase()}`}>{i.severity}</span>
+                        </td>
+                        <td>{i.anomaly_type}</td>
+                        <td>{i.asset_id}</td>
+                        <td>{i.status}</td>
+                        <td>{fmt(i.observed_value, 2)}</td>
+                        <td>{fmt(i.threshold, 2)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
           )}
 
           <h2>

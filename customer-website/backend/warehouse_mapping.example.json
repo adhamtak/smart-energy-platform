@@ -1,0 +1,24 @@
+{
+  "_help": "Optional. Copy to warehouse_mapping.json only if your table or column names differ from the defaults in snowflake_source.py (the defaults already match SMART_ENERGY_DB.SILVER). 'table' can be a TABLE or a VIEW (DB.SCHEMA.NAME works). Each column value is a column name or a SQL expression. incidents.table = null means: no incidents table yet.",
+  "readings": {
+    "table": "SILVER_SMART_METER_READINGS",
+    "columns": {
+      "ts": "EVENT_TIMESTAMP",
+      "meter_id": "METER_ID",
+      "voltage_v": "VOLTAGE_V",
+      "active_power_kw": "ACTIVE_POWER_KW",
+      "reactive_power_kvar": "REACTIVE_POWER_KVAR",
+      "energy_kwh": "ENERGY_KWH"
+    },
+    "where": "VOLTAGE_V > 0 AND ACTIVE_POWER_KW >= 0 AND ENERGY_KWH >= 0",
+    "dedupe_by": "READING_ID"
+  },
+  "dim_meter": {
+    "table": "SILVER_DIM_METER",
+    "columns": {"meter_id": "METER_ID", "transformer_id": "TRANSFORMER_ID", "customer_type": "CUSTOMER_TYPE", "phase_type": "PHASE_TYPE", "status": "STATUS"}
+  },
+  "incidents": {
+    "table": null,
+    "columns": {"incident_id": "INCIDENT_ID", "detected_at": "DETECTED_AT", "severity": "SEVERITY", "anomaly_type": "ANOMALY_TYPE", "asset_id": "ASSET_ID", "status": "STATUS", "observed_value": "OBSERVED_VALUE", "threshold": "THRESHOLD"}
+  }
+}

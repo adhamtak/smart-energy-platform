@@ -1,9 +1,12 @@
 fastapi>=0.110
 uvicorn[standard]>=0.29
 PyJWT>=2.8
-duckdb>=1.0
 pandas>=2.0
-pyarrow
-boto3
 python-dotenv
 tzdata
+# Snowflake (DATA_BACKEND=snowflake)
+snowflake-connector-python>=3.6
+# MinIO fallback (DATA_BACKEND=lakehouse), not needed when only Snowflake is used
+duckdb>=1.0
+pyarrow
+boto3

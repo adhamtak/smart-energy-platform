@@ -15,6 +15,9 @@ USERS_FILE = PORTAL_DIR / "users.json"
 try:
     from dotenv import load_dotenv
 
+    # backend/.env first (that is where DATA_BACKEND and the SNOWFLAKE_* settings live), then the project .env.
+    # load_dotenv never overwrites a value that is already set, so the first file wins.
+    load_dotenv(PORTAL_DIR / ".env")
     load_dotenv(PROJECT_ROOT / ".env")
 except ImportError:
     pass

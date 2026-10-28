@@ -5,6 +5,7 @@ import time
 
 import pandas as pd
 
+import snowflake_source as sf
 from common import (
     BUCKET, INCIDENTS_PREFIX, VOLTAGE_LOW_V, discover_layout, duckdb_connection, prepare,
     readings_source, summarize,
@@ -45,7 +46,12 @@ def _query(sql, params=()):
         con.close()
 
 
+USE_SNOWFLAKE = sf.enabled()  # DATA_BACKEND=snowflake in backend/.env
+
+
 def fetch_readings(layout, meter_id):
+    if USE_SNOWFLAKE:
+        return sf.readings_for_meter(meter_id)
     # Impossible values are dropped and duplicate reading_ids collapsed, as the data contract says.
     return _query(
         f"""
@@ -62,6 +68,8 @@ def fetch_readings(layout, meter_id):
 
 
 def fetch_meter_info(layout, meter_id):
+    if USE_SNOWFLAKE:
+        return sf.meter_info(meter_id)
     if not layout["dim_meter"]:
         return {}
     try:
@@ -74,6 +82,8 @@ def fetch_meter_info(layout, meter_id):
 
 
 def fetch_incidents(asset_ids):
+    if USE_SNOWFLAKE:
+        return sf.incidents_for(asset_ids)
     path = f"s3://{BUCKET}/{INCIDENTS_PREFIX}/*.parquet"
     marks = ",".join("?" * len(asset_ids))
     try:
@@ -93,6 +103,8 @@ class NoData(Exception):
 
 
 def get_layout():
+    if USE_SNOWFLAKE:  # nothing to discover: the tables come from warehouse_mapping.json
+        return {"readings": ["snowflake"], "dim_meter": "snowflake"}
     return cached("layout", 600, discover_layout)
 
 
