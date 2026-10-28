@@ -26,5 +26,7 @@ export const api = {
   logout: () => request('/api/auth/logout', { method: 'POST' }),
   me: () => request('/api/me'),
   meter: (id) => request(`/api/meters/${encodeURIComponent(id)}`),
+  chat: (message, meterId, lang, history) =>
+    request('/api/chat', { method: 'POST', body: JSON.stringify({ message, meter_id: meterId, lang, history }) }),
   csvUrl: (id) => `/api/meters/${encodeURIComponent(id)}/readings.csv`,
 }

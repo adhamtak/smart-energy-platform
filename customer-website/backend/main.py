@@ -13,8 +13,11 @@ import jwt
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
+from typing import Optional
+
 from pydantic import BaseModel
 
+import chat
 import service
 from common import METER_RE, PORTAL_DIR, can_access, hash_password, load_users, verify_password
 
@@ -52,6 +55,13 @@ app.add_middleware(
 class LoginBody(BaseModel):
     username: str
     password: str
+
+
+class ChatBody(BaseModel):
+    message: str
+    meter_id: Optional[str] = None
+    lang: str = "en"
+    history: list = []
 
 
 def _me(username, record):
@@ -145,6 +155,20 @@ def meter_csv(meter_id: str, user=Depends(current_user)):
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{meter_id}_readings.csv"'},
     )
+
+
+@app.post("/api/chat")
+def chat_endpoint(body: ChatBody, user=Depends(current_user)):
+    """Ask a question about the data. Answers come from read-only tools (see chat.py)."""
+    message = body.message.strip()
+    if not message:
+        raise HTTPException(400, "Empty message")
+    if len(message) > 500:
+        raise HTTPException(400, "Message too long (500 characters max)")
+    try:
+        return chat.answer(user, message, body.meter_id, body.lang, body.history)
+    except Exception as error:
+        raise HTTPException(503, f"The assistant could not answer: {error}")
 
 
 @app.post("/api/admin/refresh")
